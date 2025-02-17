@@ -965,6 +965,161 @@ class Renderer:
         # Final update to refresh everything
         bpy.context.view_layer.update()
 
+    def cleanup_unused_resources(self):
+        """Remove unused materials, meshes, images and other resources to free memory."""
+        # Remove unused materials
+        for material in bpy.data.materials:
+            if not material.users:
+                bpy.data.materials.remove(material)
+            
+        # Remove unused meshes
+        for mesh in bpy.data.meshes:
+            if not mesh.users:
+                bpy.data.meshes.remove(mesh)
+            
+        # Remove unused images
+        for image in bpy.data.images:
+            if not image.users and not image.use_fake_user:
+                bpy.data.images.remove(image)
+                
+        # Remove unused lights
+        for light in bpy.data.lights:
+            if not light.users:
+                bpy.data.lights.remove(light)
+                
+        # Remove unused node groups
+        for group in bpy.data.node_groups:
+            if not group.users:
+                bpy.data.node_groups.remove(group)
+                
+        # Force garbage collection
+        import gc
+        gc.collect()
+        
+    def optimize_scene_settings(self, render_samples=8):
+        """Configure optimal render settings for material baking."""
+        scene = bpy.context.scene
+        
+        # Reduce render samples for faster baking
+        scene.cycles.samples = render_samples  # Configurable sample count
+        scene.cycles.preview_samples = render_samples
+        
+        # Optimize baking settings
+        scene.render.bake.use_pass_direct = True
+        scene.render.bake.use_pass_indirect = False  # We don't need indirect lighting
+        scene.render.bake.use_pass_diffuse = True
+        scene.render.bake.use_pass_emit = False  # Unless needed
+        scene.render.bake.margin = 1  # Smaller margin for faster baking
+        
+        # Optimize render settings
+        scene.render.use_border = False
+        scene.render.use_persistent_data = True
+        scene.render.use_high_quality_normals = False
+        
+        # Optimize cycles settings
+        scene.cycles.use_animated_seed = False
+        scene.cycles.use_denoising = False  # Disable denoising during baking
+        scene.cycles.debug_use_spatial_splits = True  # Faster BVH
+        scene.cycles.debug_use_compact_bvh = True
+        scene.cycles.light_sampling_threshold = 0.01  # Ignore lights below this threshold
+        
+        # Configure world for faster rendering
+        world = bpy.context.scene.world
+        if world and world.use_nodes:
+            world.node_tree.nodes.clear()
+            
+            # Add simplified world setup - just diffuse lighting
+            background = world.node_tree.nodes.new("ShaderNodeBackground")
+            output = world.node_tree.nodes.new("ShaderNodeOutputWorld")
+            world.node_tree.links.new(background.outputs[0], output.inputs[0])
+            
+            # Set light grey background for ambient lighting
+            background.inputs[0].default_value = (0.2, 0.2, 0.2, 1)
+            background.inputs[1].default_value = 1.0
+    
+    def merge_similar_meshes(self):
+        """Merge meshes that share the same material to reduce draw calls."""
+        # Group objects by material
+        material_groups = {}
+        
+        for obj in bpy.data.objects:
+            if obj.type != 'MESH' or not obj.data or len(obj.material_slots) == 0:
+                continue
+                
+            # Get the material from the first slot (most blocks only have one material)
+            material = obj.material_slots[0].material
+            if not material:
+                continue
+                
+            # Group by material name
+            if material.name not in material_groups:
+                material_groups[material.name] = []
+            material_groups[material.name].append(obj)
+        
+        # For each material group with more than one object, merge them
+        merge_count = 0
+        for material_name, objects in material_groups.items():
+            if len(objects) < 5:  # Only merge if we have enough objects to make it worthwhile
+                continue
+                
+            logger.info(f"Merging {len(objects)} objects with material {material_name}")
+            
+            # Select all objects in this group
+            bpy.ops.object.select_all(action='DESELECT')
+            for obj in objects:
+                obj.select_set(True)
+            
+            # Set the active object to the first one
+            bpy.context.view_layer.objects.active = objects[0]
+            
+            # Join selected objects
+            bpy.ops.object.join()
+            merge_count += 1
+        
+        logger.info(f"Merged meshes for {merge_count} material groups")
+        return merge_count
+
+    def export_optimized_glb(self, filepath, compression_level=5):
+        """Export the scene to GLTF format with optimized settings."""
+        if not filepath.endswith(".glb"):
+            filepath += ".glb"
+
+        if os.path.exists(filepath):
+            name, ext = os.path.splitext(filepath)
+            filepath = f"{name}-{str(time.time()).split('.')[0]}{ext}"
+
+        bpy.ops.export_scene.gltf(
+            # Basic export settings
+            filepath=filepath,
+            export_format="GLB",
+            export_texture_dir="",
+            # Optimize material export
+            export_materials="EXPORT",
+            export_image_format="AUTO",
+            export_keep_originals=False,
+            export_texcoords=True,
+            export_attributes=True,
+            # Image quality settings - optimize for size
+            export_image_quality=90,  # Slightly reduce quality for better compression
+            export_jpeg_quality=90,
+            # Use Draco mesh compression with configurable level
+            export_draco_mesh_compression_enable=True,
+            export_draco_mesh_compression_level=compression_level,
+            export_draco_position_quantization=12,
+            export_draco_normal_quantization=10,
+            export_draco_texcoord_quantization=10,
+            # Material and mesh settings - optimize for performance
+            export_tangents=False,  # Unless needed
+            export_normals=True,
+            export_lights=False,
+            export_cameras=False,
+            # Transform settings  
+            export_yup=True,  # Y-up for standard glTF convention
+            # Include only used materials and textures
+            export_unused_textures=False,
+            export_vertex_color="NONE",  # Unless needed
+        )
+
     def delete_unnecessary_nodes(self):
         """Delete sunlights, unncessary world nodes, shaders, etc.
 
@@ -1007,30 +1162,105 @@ class Renderer:
         time_of_day: TimeOfDay = TimeOfDay.NOON,
         pre_export: bool = False,
         fast_render: bool = False,
+        # Additional optimization parameters
+        batch_size: int = 20,
+        compression_level: int = 5,
+        render_samples: int = 8,
+        use_texture_atlas: bool = False,
+        mesh_merge_threshold: int = 100,
     ):
         """Render a list of PlacedBlock instances."""
         types = types or ["blend", "glb"]
 
         name, _ = os.path.splitext(name)
 
-        logger.info("Placing blocks", flush=True)
+        logger.info("Processing blocks for optimal rendering", flush=True)
+        self.progress_callback("Preprocessing blocks for optimization", progress=0.0)
+        
+        # Optimization 1: Group similar blocks for instancing
+        block_groups = {}
+        for placed_block in placed_blocks:
+            block_key = placed_block.block.name
+            if block_key not in block_groups:
+                block_groups[block_key] = []
+            block_groups[block_key].append(placed_block)
+        
+        logger.info(f"Grouped {len(placed_blocks)} blocks into {len(block_groups)} unique block types")
+        self.progress_callback(f"Grouped blocks for optimization", progress=0.02)
 
-        self.progress_callback("Placing blocks in the rendered scene", progress=0.0)
-
-        # Place all blocks first
-        for i, placed_block in enumerate(placed_blocks):
-            self.place_block(placed_block)
-            if i % 100 == 0:
-                msg = f"{i+1} / {len(placed_blocks)} blocks placed in the scene"
-                logger.info(msg)
-                self.progress_callback(
-                    msg,
-                    progress=0.1 * (i + 1) / len(placed_blocks),
+        # Optimization 2: Process materials ahead of time to reduce duplicates
+        all_textures = set()
+        for block_type, blocks in block_groups.items():
+            if blocks:
+                for model in blocks[0].block.models:
+                    for element in model.elements:
+                        for face in element.faces:
+                            if face.texture:
+                                all_textures.add(face.texture)
+        
+        logger.info(f"Found {len(all_textures)} unique textures across all blocks")
+        self.progress_callback("Identified unique textures", progress=0.04)
+        
+        # Pre-create materials to avoid duplicate work
+        material_cache = {}
+        for texture in all_textures:
+            # Use simplified material name based just on texture
+            _, filename = os.path.split(texture)
+            texture_name, _ = os.path.splitext(filename)
+            material_name = f"cached_{texture_name}"
+            
+            if material_name not in material_cache:
+                mat = self.create_material(
+                    texture_path=texture,
+                    name=material_name,
+                    ambient_occlusion=True
                 )
+                material_cache[material_name] = mat
+                
+        logger.info(f"Pre-created {len(material_cache)} shared materials")
+        self.progress_callback("Pre-created shared materials", progress=0.06)
 
-        self.progress_callback("All blocks placed in the scene", progress=0.1)
+        # Placing blocks with optimized material handling
+        logger.info("Placing blocks with optimized materials", flush=True)
+        self.progress_callback("Placing blocks in the rendered scene", progress=0.08)
 
-        logger.info("Done placing blocks")
+        # Place blocks by group to improve instancing
+        block_count = 0
+        for block_type, blocks in block_groups.items():
+            # Create template object for this block type (first one)
+            if blocks:
+                template_data = self.create_block(blocks[0].block)
+                template_obj = template_data["parent"]
+                
+                # Place all instances of this block type
+                for i, placed_block in enumerate(blocks):
+                    if i == 0:  # First one is already created as template
+                        template_obj.location = Vector(
+                            (placed_block.x, placed_block.y, placed_block.z)
+                        )
+                    else:
+                        # Create instance using the template
+                        instance = template_obj.copy()
+                        instance.location = Vector(
+                            (placed_block.x, placed_block.y, placed_block.z)
+                        )
+                        bpy.context.scene.collection.objects.link(instance)
+                    
+                    block_count += 1
+                    if block_count % 500 == 0:
+                        msg = f"{block_count} / {len(placed_blocks)} blocks placed in the scene"
+                        logger.info(msg)
+                        self.progress_callback(
+                            msg,
+                            progress=0.08 + (0.12 * block_count / len(placed_blocks)),
+                        )
+
+        self.progress_callback("All blocks placed in the scene", progress=0.2)
+        logger.info("Done placing blocks - optimized placement complete")
+        
+        # Cleanup to free memory
+        self.cleanup_unused_resources()
+        self.progress_callback("Cleaned up unused resources", progress=0.22)
 
         if pre_export:
             # Continue with existing render code...
@@ -1049,36 +1279,72 @@ class Renderer:
 
             return
 
-        logger.info("Baking materials")
-        # Stage 1: Bake all materials
-        for i, material in enumerate(bpy.data.materials):
-            self.bake_material(material, time_of_day)
-            if i % 10 == 0:
-                self.progress_callback(
-                    f"{i+1} / {len(bpy.data.materials)} materials baked",
-                    progress=0.1 + (0.7 * (i + 1) / len(bpy.data.materials)),
-                )
+        # Optimize scene settings for baking with custom render samples
+        self.optimize_scene_settings(render_samples=render_samples)
+        self.progress_callback("Optimized scene settings for baking", progress=0.24)
 
-        self.progress_callback("All materials baked", progress=0.8)
+        # Apply texture atlas if enabled
+        if use_texture_atlas and not fast_render:
+            logger.info("Generating texture atlas for all materials")
+            self.generate_texture_atlas(margin=2)
+            self.remap_uvs_to_atlas()
+            self.progress_callback("Applied texture atlas optimization", progress=0.26)
+        
+        # Consider merging similar meshes if we have enough blocks
+        if len(placed_blocks) > mesh_merge_threshold and not fast_render:
+            logger.info(f"Merging similar meshes (threshold: {mesh_merge_threshold})")
+            self.merge_similar_meshes()
+            self.progress_callback("Merged similar meshes", progress=0.28)
 
-        logger.info("Done baking materials")
+        logger.info(f"Baking materials in batches (batch size: {batch_size})")
+        # Stage 1: Bake materials in batches for better performance
+        materials = list(bpy.data.materials)
+        num_batches = (len(materials) + batch_size - 1) // batch_size
+        
+        for batch_idx in range(num_batches):
+            start_idx = batch_idx * batch_size
+            end_idx = min((batch_idx + 1) * batch_size, len(materials))
+            batch = materials[start_idx:end_idx]
+            
+            for material in batch:
+                self.bake_material(material, time_of_day)
+            
+            self.progress_callback(
+                f"Batch {batch_idx+1}/{num_batches} baked ({end_idx}/{len(materials)} materials)",
+                progress=0.24 + (0.5 * (end_idx / len(materials))),
+            )
+            
+            # Free memory after each batch
+            if batch_idx % 2 == 1:  # Every other batch
+                self.cleanup_unused_resources()
+
+        self.progress_callback("All materials baked", progress=0.74)
+        logger.info("Done baking materials in optimized batches")
 
         logger.info("Applying baked materials")
         # Stage 2: Apply all baked materials
-        self.progress_callback("Applying baked materials", progress=0.81)
+        self.progress_callback("Applying baked materials", progress=0.76)
         self.apply_baked_materials()
-        self.progress_callback("Done applying baked materials", progress=0.82)
+        self.progress_callback("Done applying baked materials", progress=0.78)
         logger.info("Done applying baked materials")
 
-        logger.info("Exporting")
-        # Export based on file extension
+        # Final cleanup before export
+        self.cleanup_unused_resources()
+        self.progress_callback("Final cleanup before export", progress=0.8)
+
+        logger.info("Optimizing scene for export")
+        self.delete_unnecessary_nodes()  # Remove unneeded lights, etc.
+        self.progress_callback("Scene optimized for export", progress=0.82)
+
+        logger.info("Exporting with optimized settings")
+        # Export based on file extension with optimized settings
         if "blend" in types:
             self.export_blend(f"{name}.blend")
 
         if "glb" in types:
-            self.export_glb(f"{name}.glb")
+            self.export_optimized_glb(f"{name}.glb", compression_level=compression_level)
 
-        logger.info("Done")
+        logger.info("Done with optimized rendering")
 
     def export_blend(self, filepath):
         """Export the scene to Blender's native format."""

@@ -89,6 +89,16 @@ def render_sample(stage_context: StageContext):
         )
         placed_blocks = minecraft_world.to_blender_blocks()
 
+        logger.info(
+            "Initializing optimized renderer",
+            run_id=stage_context.run.id,
+            sample_id=stage_context.sample.id,
+            fast_render=settings.FAST_RENDER,
+            material_batch_size=settings.MATERIAL_BATCH_SIZE,
+            compression_level=settings.COMPRESSION_LEVEL,
+            render_samples=settings.RENDER_SAMPLES,
+        )
+        
         renderer = Renderer(
             progress_callback=lambda msg=None,
             progress=None: stage_context.update_stage_progress(
@@ -96,12 +106,16 @@ def render_sample(stage_context: StageContext):
                 note=msg,
             )
         )
+        
         logger.info(
-            "Rendering blocks",
+            "Rendering blocks with optimizations",
             run_id=stage_context.run.id,
             sample_id=stage_context.sample.id,
             fast_render=settings.FAST_RENDER,
+            block_count=len(placed_blocks),
         )
+        
+        # Pass optimization settings from config
         renderer.render_blocks(
             placed_blocks=placed_blocks,
             types=["glb"],
@@ -109,6 +123,12 @@ def render_sample(stage_context: StageContext):
             pre_export=False,
             name=rendered_model_glb_filepath,
             fast_render=settings.FAST_RENDER,
+            # Pass additional optimization parameters
+            batch_size=settings.MATERIAL_BATCH_SIZE,
+            compression_level=settings.COMPRESSION_LEVEL,
+            render_samples=settings.RENDER_SAMPLES,
+            use_texture_atlas=settings.TEXTURE_ATLAS_ENABLED,
+            mesh_merge_threshold=settings.MESH_MERGE_THRESHOLD,
         )
 
         object_client = get_object_store_client()
